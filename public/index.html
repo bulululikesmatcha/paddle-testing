@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaddleOCR Mobile Tester</title>
+    <style>
+        body { font-family: system-ui, sans-serif; text-align: center; margin: 0; padding: 20px; background: #fafafa; }
+        video { max-width: 100%; border-radius: 8px; margin-bottom: 10px; background: #000; }
+        #canvas, #overlay { display: none; }
+        .controls { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+        button, select { padding: 14px 24px; font-size: 16px; border-radius: 8px; border: none; background: #007bff; color: white; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        select { background: white; color: #333; border: 1px solid #ccc; }
+        #preview-wrap { position: relative; display: inline-block; max-width: 100%; }
+        #preview-wrap img, #preview-wrap canvas { max-width: 100%; border-radius: 8px; }
+        #boxes { position: absolute; top: 0; left: 0; width: 100%; height: 100%; }
+        #status { margin-top: 10px; font-size: 14px; color: #555; min-height: 20px; }
+        #result { margin-top: 20px; white-space: pre-wrap; text-align: left; background: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 8px; min-height: 50px;}
+        .line { display: flex; justify-content: space-between; gap: 10px; padding: 4px 0; border-bottom: 1px solid #eee; }
+        .line .score { color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; }
+        .line .score.low { color: #c0392b; }
+        .metrics { color: #888; font-size: 13px; margin-top: 10px; }
+    </style>
+</head>
+<body>
+    <h2>PaddleOCR Tester</h2>
+
+    <!-- playsinline prevents iOS Safari from forcing full-screen video -->
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+
+    <div class="controls">
+        <select id="langSelect">
+            <option value="ch">Chinese + English (ch)</option>
+            <option value="en">English (en)</option>
+            <option value="korean">Korean</option>
+            <option value="japan">Japanese</option>
+            <option value="chinese_cht">Chinese Traditional</option>
+        </select>
+        <button id="startBtn">1. Open Camera</button>
+        <button id="captureBtn" disabled>2. Snap & Read</button>
+        <label for="fileInput" style="padding:14px 24px;font-size:16px;border-radius:8px;background:#6c757d;color:#fff;font-weight:bold;cursor:pointer;">Or pick image file</label>
+        <input type="file" id="fileInput" accept="image/*" style="display:none;">
+    </div>
+
+    <div id="status">Loading OCR engine…</div>
+
+    <div id="preview-wrap" style="display:none;">
+        <canvas id="previewCanvas"></canvas>
+        <svg id="boxes"></svg>
+    </div>
+
+    <div id="result">Results will appear here...</div>
+
+    <script type="importmap">
+    {
+        "imports": {
+            "@paddleocr/paddleocr-js": "https://esm.sh/@paddleocr/paddleocr-js@0.4.2"
+        }
+    }
+    </script>
+
+    <script type="module">
+        import { PaddleOCR } from "@paddleocr/paddleocr-js";
+
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const startBtn = document.getElementById('startBtn');
+        const captureBtn = document.getElementById('captureBtn');
+        const fileInput = document.getElementById('fileInput');
+        const langSelect = document.getElementById('langSelect');
+        const statusDiv = document.getElementById('status');
+        const resultDiv = document.getElementById('result');
+        const previewWrap = document.getElementById('preview-wrap');
+        const previewCanvas = document.getElementById('previewCanvas');
+        const boxesSvg = document.getElementById('boxes');
+
+        let stream;
+        let ocr;
+        let ocrLang;
+
+        // Lazily (re)build the OCR pipeline whenever the selected language changes,
+        // since PaddleOCR.create() bakes the detector/recognizer models in at creation time.
+        async function getOcr() {
+            const lang = langSelect.value;
+            if (ocr && ocrLang === lang) return ocr;
+
+            statusDiv.textContent = `⏳ Loading OCR models for "${lang}" (first time may take a while)...`;
+            captureBtn.disabled = true;
+
+            if (ocr) {
+                ocr.dispose();
+                ocr = null;
+            }
+
+            ocr = await PaddleOCR.create({
+                lang,
+                ocrVersion: 'PP-OCRv5',
+                ortOptions: { backend: 'auto' }
+            });
+            ocrLang = lang;
+
+            statusDiv.textContent = 'OCR engine ready.';
+            captureBtn.disabled = !stream;
+            return ocr;
+        }
+
+        getOcr().catch(err => {
+            statusDiv.textContent = '❌ Failed to load OCR engine: ' + err.message;
+        });
+
+        langSelect.addEventListener('change', () => {
+            getOcr().catch(err => {
+                statusDiv.textContent = '❌ Failed to load OCR engine: ' + err.message;
+            });
+        });
+
+        startBtn.addEventListener('click', async () => {
+            try {
+                // Request the back camera on mobile phones
+                stream = await navigator.mediaDevices.getUserMedia({
+                    video: { facingMode: 'environment' }
+                });
+                video.srcObject = stream;
+                captureBtn.disabled = !ocr;
+                startBtn.disabled = true;
+                statusDiv.textContent = 'Camera active. Ready to scan.';
+            } catch (err) {
+                statusDiv.textContent = 'Error accessing camera: ' + err.message + ' (Make sure you are on HTTPS)';
+            }
+        });
+
+        captureBtn.addEventListener('click', async () => {
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            canvas.toBlob(blob => runOcr(blob), 'image/jpeg', 0.95);
+        });
+
+        fileInput.addEventListener('change', () => {
+            const file = fileInput.files[0];
+            if (file) runOcr(file);
+        });
+
+        async function runOcr(imageSource) {
+            captureBtn.disabled = true;
+            resultDiv.innerText = '⏳ Running OCR...';
+            statusDiv.textContent = '';
+
+            try {
+                const engine = await getOcr();
+                const bitmap = await createImageBitmap(imageSource);
+                drawPreview(bitmap);
+
+                const [result] = await engine.predict(imageSource);
+                renderResult(result);
+            } catch (err) {
+                resultDiv.innerText = '❌ Error: ' + err.message;
+                console.error(err);
+            } finally {
+                captureBtn.disabled = !stream;
+            }
+        }
+
+        function drawPreview(bitmap) {
+            previewWrap.style.display = 'inline-block';
+            previewCanvas.width = bitmap.width;
+            previewCanvas.height = bitmap.height;
+            previewCanvas.getContext('2d').drawImage(bitmap, 0, 0);
+            boxesSvg.setAttribute('viewBox', `0 0 ${bitmap.width} ${bitmap.height}`);
+        }
+
+        function renderResult(result) {
+            const items = result.items || [];
+
+            // Draw detection boxes over the preview so misreads can be traced back to bad detection vs bad recognition
+            boxesSvg.innerHTML = items.map((item, i) => {
+                const points = item.poly.map(p => `${p[0]},${p[1]}`).join(' ');
+                const hue = (i * 47) % 360;
+                return `<polygon points="${points}" fill="none" stroke="hsl(${hue},80%,45%)" stroke-width="3" />`;
+            }).join('');
+
+            if (items.length === 0) {
+                resultDiv.innerText = '(No text detected)';
+            } else {
+                resultDiv.innerHTML = items.map(item => {
+                    const pct = (item.score * 100).toFixed(1);
+                    const low = item.score < 0.8 ? ' low' : '';
+                    return `<div class="line"><span>${escapeHtml(item.text)}</span><span class="score${low}">${pct}%</span></div>`;
+                }).join('');
+            }
+
+            const m = result.metrics || {};
+            statusDiv.innerHTML = `<div class="metrics">detect: ${m.detMs?.toFixed(0)}ms · recognize: ${m.recMs?.toFixed(0)}ms · total: ${m.totalMs?.toFixed(0)}ms · boxes: ${m.detectedBoxes} · lines: ${m.recognizedCount}</div>`;
+        }
+
+        function escapeHtml(str) {
+            const div = document.createElement('div');
+            div.textContent = str;
+            return div.innerHTML;
+        }
+    </script>
+</body>
+</html>
