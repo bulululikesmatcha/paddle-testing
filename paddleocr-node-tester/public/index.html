@@ -1,0 +1,90 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaddleOCR Mobile Tester</title>
+    <style>
+        body { font-family: system-ui, sans-serif; text-align: center; margin: 0; padding: 20px; background: #fafafa; }
+        video { max-width: 100%; border-radius: 8px; margin-bottom: 10px; background: #000; }
+        #canvas { display: none; }
+        .controls { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+        button { padding: 14px 24px; font-size: 16px; border-radius: 8px; border: none; background: #007bff; color: white; cursor: pointer; font-weight: bold; }
+        button:disabled { background: #ccc; cursor: not-allowed; }
+        #result { margin-top: 20px; white-space: pre-wrap; text-align: left; background: #fff; border: 1px solid #ddd; padding: 15px; border-radius: 8px; min-height: 50px;}
+    </style>
+</head>
+<body>
+    <h2>PaddleOCR Tester</h2>
+    
+    <!-- playsinline prevents iOS Safari from forcing full-screen video -->
+    <video id="video" autoplay playsinline></video>
+    <canvas id="canvas"></canvas>
+    
+    <div class="controls">
+        <button id="startBtn">1. Open Camera</button>
+        <button id="captureBtn" disabled>2. Snap & Read</button>
+    </div>
+
+    <div id="result">Results will appear here...</div>
+
+    <script>
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const startBtn = document.getElementById('startBtn');
+        const captureBtn = document.getElementById('captureBtn');
+        const resultDiv = document.getElementById('result');
+
+        let stream;
+
+        startBtn.addEventListener('click', async () => {
+            try {
+                // Request the back camera on mobile phones
+                stream = await navigator.mediaDevices.getUserMedia({ 
+                    video: { facingMode: 'environment' } 
+                });
+                video.srcObject = stream;
+                captureBtn.disabled = false;
+                startBtn.disabled = true;
+                resultDiv.innerText = "Camera active. Ready to scan.";
+            } catch (err) {
+                resultDiv.innerText = "Error accessing camera: " + err.message + "\n(Make sure you are on HTTPS)";
+            }
+        });
+
+        captureBtn.addEventListener('click', async () => {
+            // Draw current video frame to canvas
+            canvas.width = video.videoWidth;
+            canvas.height = video.videoHeight;
+            canvas.getContext('2d').drawImage(video, 0, 0);
+            
+            resultDiv.innerText = "⏳ Uploading and extracting text...\n(First request may take longer)";
+            captureBtn.disabled = true;
+            
+            // Convert canvas to a JPEG Blob and send to backend
+            canvas.toBlob(async (blob) => {
+                const formData = new FormData();
+                formData.append('image', blob, 'capture.jpg');
+
+                try {
+                    const response = await fetch('/api/recognize', {
+                        method: 'POST',
+                        body: formData
+                    });
+                    
+                    const data = await response.json();
+                    if(data.success) {
+                        resultDiv.innerText = "📝 Result:\n\n" + data.text;
+                    } else {
+                        resultDiv.innerText = "❌ Error: " + data.error;
+                    }
+                } catch (err) {
+                    resultDiv.innerText = "❌ Fetch error: " + err.message;
+                } finally {
+                    captureBtn.disabled = false;
+                }
+            }, 'image/jpeg', 0.9);
+        });
+    </script>
+</body>
+</html>
