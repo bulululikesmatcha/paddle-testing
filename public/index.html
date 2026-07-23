@@ -8,9 +8,10 @@
         body { font-family: system-ui, sans-serif; text-align: center; margin: 0; padding: 20px; background: #fafafa; }
         video { max-width: 100%; border-radius: 8px; margin-bottom: 10px; background: #000; }
         #canvas, #overlay { display: none; }
-        .controls { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; }
+        .controls { display: flex; gap: 10px; justify-content: center; flex-wrap: wrap; align-items: center; }
         button, select { padding: 14px 24px; font-size: 16px; border-radius: 8px; border: none; background: #007bff; color: white; cursor: pointer; font-weight: bold; }
         button:disabled { background: #ccc; cursor: not-allowed; }
+        button.secondary { background: #6c757d; }
         select { background: white; color: #333; border: 1px solid #ccc; }
         #preview-wrap { position: relative; display: inline-block; max-width: 100%; }
         #preview-wrap img, #preview-wrap canvas { max-width: 100%; border-radius: 8px; }
@@ -21,6 +22,7 @@
         .line .score { color: #888; font-variant-numeric: tabular-nums; white-space: nowrap; }
         .line .score.low { color: #c0392b; }
         .metrics { color: #888; font-size: 13px; margin-top: 10px; }
+        .err { color: #c0392b; }
     </style>
 </head>
 <body>
@@ -31,6 +33,7 @@
     <canvas id="canvas"></canvas>
 
     <div class="controls">
+        <select id="cameraSelect" style="display:none;"></select>
         <select id="langSelect">
             <option value="ch">Chinese + English (ch)</option>
             <option value="en">English (en)</option>
@@ -40,11 +43,11 @@
         </select>
         <button id="startBtn">1. Open Camera</button>
         <button id="captureBtn" disabled>2. Snap & Read</button>
-        <label for="fileInput" style="padding:14px 24px;font-size:16px;border-radius:8px;background:#6c757d;color:#fff;font-weight:bold;cursor:pointer;">Or pick image file</label>
+        <label for="fileInput" class="secondary" style="padding:14px 24px;font-size:16px;border-radius:8px;color:#fff;font-weight:bold;cursor:pointer;">Or pick image file</label>
         <input type="file" id="fileInput" accept="image/*" style="display:none;">
     </div>
 
-    <div id="status">Loading OCR engine…</div>
+    <div id="status">Tap "Open Camera" to begin. The OCR engine loads on your first scan.</div>
 
     <div id="preview-wrap" style="display:none;">
         <canvas id="previewCanvas"></canvas>
@@ -56,7 +59,7 @@
     <script type="importmap">
     {
         "imports": {
-            "@paddleocr/paddleocr-js": "https://esm.sh/@paddleocr/paddleocr-js@0.4.2"
+            "@paddleocr/paddleocr-js": "https://cdn.jsdelivr.net/npm/@paddleocr/paddleocr-js@0.4.2/+esm"
         }
     }
     </script>
@@ -70,72 +73,167 @@
         const captureBtn = document.getElementById('captureBtn');
         const fileInput = document.getElementById('fileInput');
         const langSelect = document.getElementById('langSelect');
+        const cameraSelect = document.getElementById('cameraSelect');
         const statusDiv = document.getElementById('status');
         const resultDiv = document.getElementById('result');
         const previewWrap = document.getElementById('preview-wrap');
         const previewCanvas = document.getElementById('previewCanvas');
         const boxesSvg = document.getElementById('boxes');
 
+        const OCR_LOAD_TIMEOUT_MS = 60000;
+
         let stream;
+        let imageCapture; // ImageCapture bound to the current track, for full-resolution stills
         let ocr;
         let ocrLang;
+        let ocrLoading = null; // in-flight load promise, so concurrent calls share it
 
-        // Lazily (re)build the OCR pipeline whenever the selected language changes,
-        // since PaddleOCR.create() bakes the detector/recognizer models in at creation time.
+        function withTimeout(promise, ms, message) {
+            let timer;
+            const timeout = new Promise((_, reject) => {
+                timer = setTimeout(() => reject(new Error(message)), ms);
+            });
+            return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+        }
+
+        // OCR models are loaded lazily on first scan (not on page load) so that opening the
+        // camera is never blocked by the multi-megabyte WASM/opencv/model download+compile step.
         async function getOcr() {
             const lang = langSelect.value;
             if (ocr && ocrLang === lang) return ocr;
+            if (ocrLoading) return ocrLoading;
 
-            statusDiv.textContent = `⏳ Loading OCR models for "${lang}" (first time may take a while)...`;
-            captureBtn.disabled = true;
+            statusDiv.textContent = `⏳ Loading OCR models for "${lang}" (first time can take 10-60s)...`;
 
-            if (ocr) {
-                ocr.dispose();
-                ocr = null;
+            ocrLoading = (async () => {
+                if (ocr) {
+                    ocr.dispose();
+                    ocr = null;
+                }
+                const engine = await withTimeout(
+                    PaddleOCR.create({
+                        lang,
+                        ocrVersion: 'PP-OCRv5',
+                        ortOptions: {
+                            backend: 'wasm',
+                            wasmPaths: 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.24.3/dist/'
+                        }
+                    }),
+                    OCR_LOAD_TIMEOUT_MS,
+                    `Timed out loading OCR models after ${OCR_LOAD_TIMEOUT_MS / 1000}s (slow/blocked network?)`
+                );
+                ocr = engine;
+                ocrLang = lang;
+                statusDiv.textContent = 'OCR engine ready.';
+                return engine;
+            })();
+
+            try {
+                return await ocrLoading;
+            } catch (err) {
+                statusDiv.innerHTML = `<span class="err">❌ Failed to load OCR engine: ${escapeHtml(err.message)}</span>`;
+                throw err;
+            } finally {
+                ocrLoading = null;
             }
-
-            ocr = await PaddleOCR.create({
-                lang,
-                ocrVersion: 'PP-OCRv5',
-                ortOptions: { backend: 'auto' }
-            });
-            ocrLang = lang;
-
-            statusDiv.textContent = 'OCR engine ready.';
-            captureBtn.disabled = !stream;
-            return ocr;
         }
 
-        getOcr().catch(err => {
-            statusDiv.textContent = '❌ Failed to load OCR engine: ' + err.message;
+        langSelect.addEventListener('change', () => {
+            // Next capture will (re)load the models for the newly selected language.
+            ocr = null;
         });
 
-        langSelect.addEventListener('change', () => {
-            getOcr().catch(err => {
-                statusDiv.textContent = '❌ Failed to load OCR engine: ' + err.message;
-            });
-        });
+        async function listCameras() {
+            try {
+                const devices = await navigator.mediaDevices.enumerateDevices();
+                const cams = devices.filter(d => d.kind === 'videoinput');
+                cameraSelect.innerHTML = cams.map((c, i) =>
+                    `<option value="${c.deviceId}">${escapeHtml(c.label || `Camera ${i + 1}`)}</option>`
+                ).join('');
+                cameraSelect.style.display = cams.length > 1 ? 'inline-block' : 'none';
+                return cams;
+            } catch {
+                return [];
+            }
+        }
+
+        async function openCamera(deviceId) {
+            // Ask for the highest resolution the lens supports so captures aren't upscaled/blurry.
+            // Many phones expose several rear lenses (wide/ultra-wide/telephoto); deviceId lets the
+            // user pick a specific one instead of whatever "environment" happens to default to.
+            const videoConstraints = deviceId
+                ? { deviceId: { exact: deviceId }, width: { ideal: 4096 }, height: { ideal: 2160 } }
+                : { facingMode: { ideal: 'environment' }, width: { ideal: 4096 }, height: { ideal: 2160 } };
+
+            if (stream) {
+                stream.getTracks().forEach(t => t.stop());
+            }
+
+            stream = await navigator.mediaDevices.getUserMedia({ video: videoConstraints });
+            video.srcObject = stream;
+
+            const [track] = stream.getVideoTracks();
+
+            // Prefer continuous autofocus when the browser exposes it (helps a lot with blur on phones).
+            try {
+                const caps = track.getCapabilities ? track.getCapabilities() : {};
+                if (caps.focusMode && caps.focusMode.includes('continuous')) {
+                    await track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] });
+                }
+            } catch {
+                // Not fatal — just means autofocus constraint isn't supported on this device.
+            }
+
+            imageCapture = ('ImageCapture' in window) ? new ImageCapture(track) : null;
+
+            // Now that we have permission, device labels become available — refresh the picker.
+            await listCameras();
+            if (deviceId) cameraSelect.value = deviceId;
+        }
 
         startBtn.addEventListener('click', async () => {
+            startBtn.disabled = true;
             try {
-                // Request the back camera on mobile phones
-                stream = await navigator.mediaDevices.getUserMedia({
-                    video: { facingMode: 'environment' }
-                });
-                video.srcObject = stream;
-                captureBtn.disabled = !ocr;
-                startBtn.disabled = true;
+                await openCamera(cameraSelect.value || undefined);
+                captureBtn.disabled = false;
                 statusDiv.textContent = 'Camera active. Ready to scan.';
             } catch (err) {
-                statusDiv.textContent = 'Error accessing camera: ' + err.message + ' (Make sure you are on HTTPS)';
+                statusDiv.innerHTML = `<span class="err">Error accessing camera: ${escapeHtml(err.message)} (Make sure you are on HTTPS or localhost)</span>`;
+            } finally {
+                startBtn.disabled = false;
+            }
+        });
+
+        cameraSelect.addEventListener('change', async () => {
+            if (!stream) return;
+            try {
+                await openCamera(cameraSelect.value);
+            } catch (err) {
+                statusDiv.innerHTML = `<span class="err">Error switching camera: ${escapeHtml(err.message)}</span>`;
             }
         });
 
         captureBtn.addEventListener('click', async () => {
-            canvas.width = video.videoWidth;
-            canvas.height = video.videoHeight;
-            canvas.getContext('2d').drawImage(video, 0, 0);
-            canvas.toBlob(blob => runOcr(blob), 'image/jpeg', 0.95);
+            try {
+                // ImageCapture.takePhoto() grabs a full-resolution still straight from the sensor
+                // pipeline, which is noticeably sharper than drawing the (often downscaled) live
+                // video frame onto a canvas. Fall back to the canvas grab where unsupported (e.g. iOS Safari).
+                if (imageCapture && imageCapture.takePhoto) {
+                    const blob = await imageCapture.takePhoto();
+                    runOcr(blob);
+                } else {
+                    canvas.width = video.videoWidth;
+                    canvas.height = video.videoHeight;
+                    canvas.getContext('2d').drawImage(video, 0, 0);
+                    canvas.toBlob(blob => runOcr(blob), 'image/jpeg', 0.95);
+                }
+            } catch (err) {
+                // takePhoto() can fail transiently on some Android devices; fall back to a video-frame grab.
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+                canvas.getContext('2d').drawImage(video, 0, 0);
+                canvas.toBlob(blob => runOcr(blob), 'image/jpeg', 0.95);
+            }
         });
 
         fileInput.addEventListener('change', () => {
@@ -146,7 +244,6 @@
         async function runOcr(imageSource) {
             captureBtn.disabled = true;
             resultDiv.innerText = '⏳ Running OCR...';
-            statusDiv.textContent = '';
 
             try {
                 const engine = await getOcr();
@@ -156,7 +253,7 @@
                 const [result] = await engine.predict(imageSource);
                 renderResult(result);
             } catch (err) {
-                resultDiv.innerText = '❌ Error: ' + err.message;
+                resultDiv.innerHTML = `<span class="err">❌ Error: ${escapeHtml(err.message)}</span>`;
                 console.error(err);
             } finally {
                 captureBtn.disabled = !stream;
@@ -200,6 +297,10 @@
             div.textContent = str;
             return div.innerHTML;
         }
+
+        // Populate the camera picker up front where labels are already available (e.g. desktop
+        // after a prior grant); it will be refreshed with real labels once permission is granted.
+        listCameras();
     </script>
 </body>
 </html>
